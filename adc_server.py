@@ -1,5 +1,5 @@
 # Cherrypy Web server for WebGL data display
-# Copyright (c) Jeremy P Bentham 2021
+# Copyright (c) Jeremy P Bentham 2021. See http://iosoft.blog for details
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
