@@ -13,7 +13,7 @@
      See the License for the specific language governing permissions and
      limitations under the License.
 
-     v0.16 JPB 11/1/21  Tidied up for first release
+     v0.17 JPB 13/1/21  Removed duplicate init_graph
 -->
 <html>
    <body onload=start_graph()>
@@ -97,7 +97,6 @@
             } catch (e) {
                 alert("Error: "+e);
             }
-            init_graph();
             window.addEventListener("resize", resize_canvas);
             draw_test_graph();
             redraw_graph();
