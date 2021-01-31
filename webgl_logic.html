@@ -1,0 +1,326 @@
+<!doctype html>
+<meta charset="UTF-8">
+<html>
+<!-- Simple oscilloscope trace plot using WebGL
+     Copyright (c) Jeremy P Bentham 2021. See http://iosoft.blog for details
+
+     Licensed under the Apache License, Version 2.0 (the "License");
+     you may not use this file except in compliance with the License.
+     You may obtain a copy of the License at
+       http://www.apache.org/licenses/LICENSE-2.0
+
+     Unless required by applicable law or agreed to in writing, software
+     distributed under the License is distributed on an "AS IS" BASIS,
+     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+     See the License for the specific language governing permissions and
+     limitations under the License.
+
+     v0.24 JPB 30/1/21  Removed sr file decoding, added display animation
+-->
+   <head><style>
+      .container {
+         position: relative;
+      }
+      #graph_canvas {
+         position: relative;
+         left: 0; top: 0; z-index: 1;
+      }
+      #text_canvas {
+         position: absolute;
+         left: 0; top: 0; z-index: 10;
+      }
+   </style></head>
+   <body>
+     <div class="container">
+         <canvas id="graph_canvas"></canvas>
+         <canvas id="text_canvas"></canvas>
+     </div>
+      <button id="single_btn"   onclick="run_single(this)">Single</button>
+      <button id="run_stop_btn" onclick="run_stop(this)"  >Run</button>
+      <select id="sel_nchans" onchange="sel_nchans()"></select>
+      <select id="sel_zoom"   onchange="sel_zoom()"  ></select>
+      <pre id="status" style="font-size: 14px; margin: 8px"></pre>
+      <script>
+        "use strict";
+        var version = "webgl_logic v0.24"
+        window.onload = start_graph;
+        const XMIN=-1.0, XMAX=1.0, YMIN=-1.0, YMAX=1.0, NSAMP=20000;
+        const XMARGIN=60, YMARGIN=90, MIN_CHANS=1, MAX_CHANS=16, NCHANS=16;
+        const LABEL_SIZE = [XMARGIN-3, 14];
+        const ZOOM_VALS = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000];
+        var canvas = elem('graph_canvas'), gl = canvas.getContext('webgl2');
+        var text_canvas = elem("text_canvas"), text_ctx = text_canvas.getContext("2d");
+        var clear_colour = [0.82, 0.87, 0.82, 1.0];
+        var program, running=false, nchans=NCHANS;
+        var trace_scoffs=new Array(MAX_CHANS);
+        var trace_data=[], trace_ids=[], frag_code, vert_code;
+        var nsamp=NSAMP, disp_nsamp=nsamp, disp_oset=0, test_num=0, test_inc=0x111;
+
+         // Fragment shader for WebGL 2.0
+        frag_code = `#version 300 es
+            precision mediump float;
+            in vec4 v_colour;
+            out vec4 o_colour;
+            void main() {
+                o_colour = v_colour;
+            }`;
+
+        // Vertex shader for WebGL 2.0
+        vert_code = `#version 300 es
+            #define MAX_CHANS ${MAX_CHANS}
+            in float a_data;
+            out vec4 v_colour;
+            uniform vec2 u_scoffs[MAX_CHANS];
+            uniform int u_nsamp, u_nchans, u_disp_nsamp, u_disp_oset;
+            void main(void) {
+               int d = int(a_data);
+               bool hi = (d & (1<<gl_InstanceID)) != 0;
+               float x = float(gl_VertexID-u_disp_oset) * (2.0/float(u_disp_nsamp)) - 1.0;
+               float y = u_scoffs[gl_InstanceID][1];
+               if (hi)
+                   y += u_scoffs[gl_InstanceID][0];
+               gl_Position = vec4(x, y, 0, 1);
+               v_colour = hi ? vec4(0.8, 0.2, 0.2, 1.0) : vec4(0.3, 0.3, 0.3, 1.0);
+            }`;
+
+        // Start creating display
+        function start_graph() {
+            var sel = elem("sel_nchans");
+            for (var n=MIN_CHANS; n<=NCHANS; n++)
+                sel.options.add(new Option(n+" channel"+(n>1?"s":""), n));
+            sel.selectedIndex = 15;
+            var sel = elem("sel_zoom");
+            for (var n=0; n<ZOOM_VALS.length; n++)
+                sel.options.add(new Option(n ? ("Zoom x"+ZOOM_VALS[n]) :
+                                                "No zoom", ZOOM_VALS[n]));
+            try {
+                init_graph();
+            } catch (e) {
+                alert("Error: "+e);
+            }
+            window.addEventListener("resize", resize_canvas);
+            document.addEventListener('keydown', (event) => {
+                key_handler(event);}, false);
+            draw_test_graph();
+            redraw_graph();
+            resize_canvas();
+        }
+
+        // Initialise graph
+        function init_graph() {
+            var vertex_buffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, vertex_buffer);
+            var frag_shader = compile_shader(gl.FRAGMENT_SHADER, frag_code);
+            var vert_shader = compile_shader(gl.VERTEX_SHADER, vert_code);
+            program = gl.createProgram();
+            gl.attachShader(program, vert_shader);
+            gl.attachShader(program, frag_shader);
+            gl.linkProgram(program);
+            gl.useProgram(program);
+            var coord = gl.getAttribLocation(program, "a_data");
+            gl.vertexAttribPointer(coord, 1, gl.FLOAT, false, 0, 0);
+            gl.enableVertexAttribArray(coord);
+            disp_status(version)
+        }
+
+        // Compile a shader
+        function compile_shader(typ, source) {
+            var s = gl.createShader(typ);
+            gl.shaderSource(s, source);
+            gl.compileShader(s);
+            if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+                throw "Could not compile " +
+                      (typ==gl.VERTEX_SHADER ? "vertex" : "fragment") +
+                      " shader:\n\n"+gl.getShaderInfoLog(s);
+            return(s);
+        }
+
+        // Draw initial graph with test data
+        function draw_test_graph() {
+            gl.clearColor(...clear_colour);
+            init_scale_offsets();
+            trace_data = [];
+            for (var i=0; i<nsamp/2; i++) {
+                trace_data.push(i+test_num);
+                trace_data.push(i+test_num);
+            }
+            update_data();
+        }
+
+        // Prepare the data for a graph redraw
+        function update_data() {
+            gl.uniform1i(gl.getUniformLocation(program, 'u_nsamp'), nsamp);
+            gl.uniform1i(gl.getUniformLocation(program, 'u_nchans'), nchans);
+            gl.uniform1i(gl.getUniformLocation(program, 'u_disp_nsamp'), disp_nsamp);
+            gl.uniform1i(gl.getUniformLocation(program, 'u_disp_oset'), disp_oset);
+            gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(trace_data), gl.STATIC_DRAW);
+        }
+
+        // Redraw the graph
+        function redraw_graph() {
+            gl.viewport(XMARGIN, 0, canvas.width-XMARGIN, canvas.height);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+            if (trace_data.length)
+                gl.drawArraysInstanced(gl.LINE_STRIP, 0, trace_data.length, nchans);
+        }
+
+        // Initialise the scale & offset values for channels
+        function init_scale_offsets() {
+                scale_offsets(0, YMIN, YMAX*1.0, nchans);
+            var u = gl.getUniformLocation(program, 'u_scoffs');
+            gl.uniform2fv(u, new Float32Array(flatten(trace_scoffs)));
+        }
+
+        // Calculate scale & offset values for 1 set of channels
+        function scale_offsets(idx, ymin, ymax, nchans) {
+            var dy = (ymax-ymin) / nchans;
+            for (var n=0; n<nchans; n++) {
+                var scoff = [dy/1.4, ymax - (n+1)*dy + 0.01];
+                trace_scoffs[idx+n] = scoff;
+            }
+        }
+
+        // Get data from server, redraw graph
+        function get_data(fname) {
+            fetch(fname).then((response) => {
+                return response.ok ? response.text() : ""
+            })
+            .then(data => {
+                var vals = csv_decode(data);
+                disp_status(data ? vals.length+" samples" : "No data");
+            })
+            .catch(error => {
+                disp_status("Can't load data");
+            });
+        }
+
+         // Animate the display
+        function animate() {
+            test_num += test_inc;
+            draw_test_graph();
+            redraw_graph();
+            if (running)
+                window.requestAnimationFrame(animate);
+        }
+
+        // Handle 'single' button press
+        function run_single(btn) {
+            if (running)
+                run_stop(elem('run_stop_btn'));
+            animate();
+        }
+
+        // Handle 'run/stop' button press
+        function run_stop(btn) {
+            running = !running;
+            btn.innerText = running ? "Stop" : "Run";
+            if (running)
+                animate();
+        }
+
+        // Update the status display
+        function disp_status(s) {
+            elem('status').innerHTML = s.trim();
+        }
+
+        // Clear the text canvas
+        function text_clear() {
+            text_ctx.clearRect(0, 0, text_ctx.canvas.width, text_ctx.canvas.height);
+        }
+
+        // Draw a text box, given bottom-left corner
+        function text_box(x, y, w, h, txt) {
+            text_ctx.font = h + 'px sans-serif';
+            text_ctx.beginPath();
+            text_ctx.textBaseline = "bottom";
+            text_ctx.rect(x-1, y-h-1, w+2, h);
+            text_ctx.stroke();
+            text_ctx.fillText(txt, x, y, w);
+        }
+
+        // Label all the traces
+        function redraw_labels() {
+            text_clear();
+            for (var i=1; i <= nchans; i++)
+                label_trace(i-1, trace_ids && trace_ids.length ? trace_ids[i] : "Chan "+i);
+        }
+
+        // Label a trace, first trace is 0
+        function label_trace(n, txt) {
+            var y = trace_scoffs[n][1];
+            var pos = pixel_pos(XMIN, y);
+            text_box(pos[0]+1, pos[1], ...LABEL_SIZE, " "+txt);
+        }
+
+        // Return xy pixel position, given normalised coords
+        function pixel_pos(x, y) {
+            return [canvas.width*(x-XMIN)/(XMAX-XMIN), canvas.height*(YMAX-y)/(YMAX-YMIN)];
+        }
+
+        // Handle resizing of the canvas
+        function resize_canvas() {
+            canvas.width  = text_canvas.width = window.innerWidth - XMARGIN/2;
+            canvas.height = text_canvas.height = window.innerHeight - YMARGIN;
+            redraw_graph();
+            redraw_labels();
+        }
+
+        // Handle a keypress
+        function key_handler(event) {
+            //console.log(event);
+            switch (event.key) {
+                case '+': sel_zoom(1); break;
+                case '-': sel_zoom(-1); break;
+                case 'ArrowRight': pan_zoom(disp_nsamp/10); break;
+                case 'ArrowLeft': pan_zoom(-disp_nsamp/10); break;
+                case 'Home':      pan_zoom(-1e10); break;
+                case 'End':       pan_zoom(1e10); break;
+            }
+        }
+
+        // Change number of channels
+        function sel_nchans() {
+            var sel = elem("sel_nchans");
+            nchans = parseInt(sel.options[sel.selectedIndex].value);
+            sel_zoom(0);
+            redraw_labels();
+        }
+
+        // Select zoom level
+        function sel_zoom(diff) {
+            var sel = elem("sel_zoom");
+            if (diff>0 && sel.selectedIndex+diff < sel.options.length)
+                sel.selectedIndex++;
+            else if (diff<0 && sel.selectedIndex > 0)
+                sel.selectedIndex--;
+            var val = parseInt(sel.options[sel.selectedIndex].value);
+            disp_nsamp = val > 1 ? parseInt(nsamp / val) : nsamp;
+            init_scale_offsets();
+            update_data();
+            redraw_graph();
+        }
+
+        // Pan the zoomed area
+        function pan_zoom(diff) {
+            if (diff>0 && disp_nsamp)
+                diff = Math.min(diff, nsamp-(disp_oset+disp_nsamp));
+            else if (diff<0 && disp_nsamp)
+                diff = -Math.min(-diff, disp_oset);
+            diff = parseInt(diff);
+            disp_oset += diff;
+            if (diff)
+                sel_zoom(0);
+        }
+
+        // Flatten an array
+        function flatten(a) {
+            return a.reduce((acc, val) => acc.concat(val), []);
+        }
+
+        // Return a document element, given ID
+        function elem(id) {
+            return document.getElementById(id);
+        }
+      </script>
+   </body>
+</html>
